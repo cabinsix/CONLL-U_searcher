@@ -1,0 +1,608 @@
+# to be runned in python, please read README
+
+import os
+import tkinter as tk
+from tkinter import ttk, scrolledtext, filedialog, messagebox
+from collections import Counter, defaultdict
+import re
+import csv
+from functools import partial
+
+def export_csv(rows, filename, headers):
+    with open(filename, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(headers)
+        writer.writerows(rows)
+
+
+# ---------------- Backend ----------------
+
+def summarize_token_stats(sentences, filters, field="lemma", exclude_pos=None):
+    """
+    Restituisce un dizionario con:
+    - num_sentences: numero di frasi in cui compare almeno un token matching i filtri
+    - total_occurrences: numero totale di occorrenze dei token matching
+    - freq_per_million: frequenza normalizzata per milione di token (escludendo PUNCT se richiesto)
+    """
+    num_sentences = 0
+    total_occurrences = 0
+    total_tokens = 0
+
+    for s in sentences:
+        sentence_has_token = False
+        for t in s["tokens"]:
+            # conteggio totale dei token (escludendo eventualmente PUNCT)
+            if not exclude_pos or t["upos"] not in exclude_pos:
+                total_tokens += 1
+
+            # token matching
+            if match_token_advanced(t, filters):
+                total_occurrences += 1
+                sentence_has_token = True
+
+        if sentence_has_token:
+            num_sentences += 1
+
+    freq_per_million = (total_occurrences / total_tokens * 1_000_000) if total_tokens > 0 else 0
+    return {
+        "num_sentences": num_sentences,
+        "total_occurrences": total_occurrences,
+        "freq_per_million": freq_per_million,
+        "total_tokens": total_tokens
+    }
+
+
+def find_conllu(folder):
+    files = []
+    for root, dirs, fs in os.walk(folder):
+        for f in fs:
+            if f.endswith(".conllu"):
+                files.append(os.path.join(root, f))
+    return files
+
+def parse_feats(feats_str):
+    feats = {}
+    if feats_str and feats_str != "_":
+        for f in feats_str.split("|"):
+            if "=" in f:
+                k,v = f.split("=",1)
+                feats[k] = v
+    return feats
+
+def parse_misc(misc_str):
+    misc = {}
+    if misc_str and misc_str != "_":
+        for m in misc_str.split("|"):
+            if "=" in m:
+                k,v = m.split("=",1)
+            else:
+                k,v = m, True
+            misc[k] = v
+    return misc
+
+def read_conllu_sentences(file_path):
+    sentences = []
+    with open(file_path,'r',encoding='utf-8',errors='ignore') as f:
+        lines = f.read().split('\n')
+    sent_lines = []
+    sent_id = None
+    for line in lines+['']:
+        if line.startswith('# sent_id'):
+            sent_id = line.split('=')[1].strip()
+        if line.startswith('#') or not line.strip():
+            if sent_lines and sent_id:
+                tokens=[]
+                text=""
+                for l in sent_lines:
+                    if l.startswith('# text'):
+                        text=l.split('=')[1].strip()
+                    else:
+                        fields=l.split('\t')
+                        if len(fields)>=10:
+                            tokens.append({
+                                "id":fields[0],
+                                "form":fields[1],
+                                "lemma":fields[2],
+                                "upos":fields[3],
+                                "xpos":fields[4],
+                                "feats":parse_feats(fields[5]),
+                                "head":fields[6],
+                                "deprel":fields[7],
+                                "deps":fields[8],
+                                "misc":parse_misc(fields[9])
+                            })
+                sentences.append({"sent_id":sent_id,"text":text,"tokens":tokens})
+                sent_lines=[]
+            sent_id=None if not line.startswith('# sent_id') else sent_id
+        else:
+            sent_lines.append(line)
+    return sentences
+
+def read_all_corpora(base_dir):
+    all_corpora = {}
+    for corpus_name in os.listdir(base_dir):
+        corpus_path=os.path.join(base_dir,corpus_name)
+        if os.path.isdir(corpus_path):
+            sentences=[]
+            files=find_conllu(corpus_path)
+            for f in files:
+                sents_file=read_conllu_sentences(f)
+                for s in sents_file:
+                    s['corpus']=corpus_name
+                sentences.extend(sents_file)
+            all_corpora[corpus_name]=sentences
+    return all_corpora
+
+# ---------------- Advanced Filter ----------------
+def parse_filter_string(s):
+    if not s: 
+        return []
+    tokens = re.split(r'\s+(AND|OR)\s+', s.strip(), flags=re.IGNORECASE)
+    conditions = []
+    comb = "AND"
+    for token in tokens:
+        token = token.strip()
+        if token.upper() in ("AND","OR"):
+            comb = token.upper()
+        else:
+            if "!=" in token:
+                field, val = token.split("!=",1)
+                op="!="
+            elif "=" in token:
+                field, val = token.split("=",1)
+                op="="
+            else:
+                field, val, op = token, "True", "="
+            field = field.strip()
+            val = val.strip()
+            if field not in ["lemma","form","upos","deprel"]:
+                if field.startswith("MISC:"):
+                    pass
+                else:
+                    field="FEATS:"+field
+            conditions.append({"field":field,"op":op,"val":val,"comb":comb})
+            comb="AND"
+    return conditions
+
+def match_token_advanced(token,filters):
+    result=None
+    for cond in filters:
+        field=cond["field"]
+        op=cond["op"]
+        val=cond["val"]
+        comb=cond.get("comb","AND").upper()
+        if field in ["lemma","form","upos","deprel"]:
+            token_val=token.get(field)
+        elif field.startswith("FEATS:"):
+            token_val=token["feats"].get(field.split(":",1)[1])
+        elif field.startswith("MISC:"):
+            key=field.split(":",1)[1]
+            token_val=token["misc"].get(key,None)
+            if token_val is True:
+                token_val=key
+        if op=="=":
+            cond_result=(token_val==val)
+        elif op=="!=":
+            cond_result=(token_val!=val)
+        else:
+            cond_result=False
+        if result is None:
+            result=cond_result
+        else:
+            if comb=="AND":
+                result=result and cond_result
+            elif comb=="OR":
+                result=result or cond_result
+    return result if result is not None else False
+
+def search_sentences_advanced(all_corpora,filters,selected_corpora=None,sent_query=None):
+    results=defaultdict(list)
+    corpora_to_search=selected_corpora if selected_corpora else all_corpora.keys()
+    for corpus in corpora_to_search:
+        if corpus not in all_corpora: continue
+        for s in all_corpora[corpus]:
+            if sent_query and sent_query not in s['sent_id']: continue
+            for t in s['tokens']:
+                if match_token_advanced(t,filters):
+                    results[corpus].append(s)
+                    break
+    return results
+
+# ---------------- Keyword / KWIC / Collocations ----------------
+def keyword_analysis(sentences,field="lemma",exclude_pos=None):
+    counter=Counter()
+    total_tokens=0
+    for s in sentences:
+        for t in s['tokens']:
+            if exclude_pos and t['upos'] in exclude_pos:
+                continue
+            counter[t[field]]+=1
+            total_tokens+=1
+    freqs=[]
+    for k,v in counter.items():
+        rel=v/total_tokens if total_tokens>0 else 0
+        freqs.append((k,v,rel))
+    freqs.sort(key=lambda x:x[1], reverse=True)
+    return freqs[:50]
+
+def kwic(sentences,filters,window=20,field="lemma"):
+    concordances=[]
+    for s in sentences:
+        tokens=[t[field] for t in s['tokens']]
+        for i,tkn in enumerate(tokens):
+            if match_token_advanced(s['tokens'][i],filters):
+                start=max(0,i-window)
+                end=min(len(tokens),i+window+1)
+                left=' '.join(tokens[start:i])
+                center=tokens[i]
+                right=' '.join(tokens[i+1:end])
+                concordances.append({"left":left,"center":center,"right":right,"sent_id":s['sent_id']})
+    return concordances
+
+def collocations(sentences,filters,left=1,right=1,field="lemma",upos_include=None):
+    counter=Counter()
+    total_tokens=0
+    for s in sentences:
+        tokens=[t[field] for t in s['tokens']]
+        for i,tkn in enumerate(tokens):
+            if match_token_advanced(s['tokens'][i],filters):
+                start=max(0,i-left)
+                end=min(len(tokens),i+right+1)
+                for j in range(start,end):
+                    if j!=i:
+                        if upos_include and s['tokens'][j]['upos'] not in upos_include:
+                            continue
+                        counter[tokens[j]]+=1
+                        total_tokens+=1
+    freqs=[]
+    for k,v in counter.items():
+        rel=v/total_tokens if total_tokens>0 else 0
+        freqs.append((k,v,rel))
+    freqs.sort(key=lambda x:x[1], reverse=True)
+    return freqs[:50]
+
+def frequent_deps(sentences,filters):
+    counter=Counter()
+    total_tokens=0
+    for s in sentences:
+        for t in s['tokens']:
+            if match_token_advanced(t,filters):
+                counter[t['deprel']]+=1
+                total_tokens+=1
+    freqs=[]
+    for k,v in counter.items():
+        rel=v/total_tokens if total_tokens>0 else 0
+        freqs.append((k,v,rel))
+    freqs.sort(key=lambda x:x[1], reverse=True)
+    return freqs[:50]
+
+def frequent_feats(sentences,filters):
+    counter=Counter()
+    total_tokens=0
+    for s in sentences:
+        for t in s['tokens']:
+            if match_token_advanced(t,filters):
+                for k,v in t['feats'].items():
+                    counter[f"{k}={v}"]+=1
+                    total_tokens+=1
+    freqs=[]
+    for k,v in counter.items():
+        rel=v/total_tokens if total_tokens>0 else 0
+        freqs.append((k,v,rel))
+    freqs.sort(key=lambda x:x[1], reverse=True)
+    return freqs[:50]
+
+# ---------------- GUI ----------------
+def parse_filters_gui():
+    filter_str = []
+
+    if entry_lemma.get().strip():
+        filter_str.append(f"lemma={entry_lemma.get().strip()}")
+    if entry_form.get().strip():
+        filter_str.append(f"form={entry_form.get().strip()}")
+    if entry_upos.get().strip():
+        upos_list = entry_upos.get().strip().split("|")
+        filter_str.append(" OR ".join([f"upos={u.strip()}" for u in upos_list]))
+    if entry_feats.get().strip():
+        filter_str.append(entry_feats.get().strip())
+    if entry_misc.get().strip():
+        misc_parts = entry_misc.get().strip().split("|")
+        filter_str.append(" OR ".join([f"MISC:{m.strip()}" if "=" in m else f"MISC:{m.strip()}=True" for m in misc_parts]))
+    if entry_deprel.get().strip():
+        deprel_list = entry_deprel.get().strip().split("|")
+        filter_str.append(" OR ".join([f"deprel={d.strip()}" for d in deprel_list]))
+    if entry_deprel.get().strip():
+        deprel_list = entry_deprel.get().strip().split("|")
+
+    final_filter_str = " AND ".join(filter_str)
+    return parse_filter_string(final_filter_str)
+
+def export_kwic_tokens_csv(results, filters, window, field):
+    folder = filedialog.askdirectory(title="Select folder for KWIC CSVs")
+    if not folder:
+        return
+
+    for corpus_name, sentences in results.items():
+        rows = []
+
+        for s in sentences:
+            tokens = s["tokens"]
+
+            for i, t in enumerate(tokens):
+
+                # 🔴 QUESTA È LA LINEA CHIAVE
+                if not match_token_advanced(t, filters):
+                    continue
+
+                start = max(0, i - window)
+                end = min(len(tokens), i + window + 1)
+
+                left_ctx = " ".join(tokens[j][field] for j in range(start, i))
+                kwic = tokens[i][field]
+                right_ctx = " ".join(tokens[j][field] for j in range(i + 1, end))
+
+                rows.append([
+                    corpus_name,
+                    s["sent_id"],
+                    t["id"],
+                    left_ctx,
+                    kwic,
+                    right_ctx,
+                    t["form"],
+                    t["lemma"],
+                    t["upos"],
+                    t["xpos"],
+                    "|".join(f"{k}={v}" for k, v in t["feats"].items()) if t["feats"] else "_",
+                    t["head"],
+                    t["deprel"],
+                    t["deps"],
+                    "|".join(f"{k}={v}" for k, v in t["misc"].items()) if t["misc"] else "_"
+                ])
+
+        if rows:
+            fname = os.path.join(folder, f"{corpus_name}_KWIC_tokens.csv")
+            export_csv(
+                rows,
+                fname,
+                [
+                    "Corpus",
+                    "Sent_ID",
+                    "Token_Number",
+                    "Left_Context",
+                    "KWIC",
+                    "Right_Context",
+                    "FORM",
+                    "LEMMA",
+                    "UPOS",
+                    "XPOS",
+                    "FEATS",
+                    "HEAD",
+                    "DEPREL",
+                    "DEPS",
+                    "MISC"
+                ]
+            )
+
+def search_gui():
+    # ottieni filtri e corpora
+    selected_corpora = [listbox_corpora.get(i) for i in listbox_corpora.curselection()] or None
+    filters = parse_filters_gui()
+    sent_query = entry_sentid.get().strip() if entry_sentid.get().strip() else None
+    results = search_sentences_advanced(all_corpora, filters, selected_corpora, sent_query)
+
+    if not results:
+        messagebox.showinfo("Info", "No sentences found!")
+        return
+
+    # 🔹 Nuova finestra pop-up per ogni ricerca
+    result_window = tk.Toplevel(root)
+    result_window.title("Search Results")
+    result_window.geometry("1000x600")
+
+    # PanedWindow verticale dentro il pop-up
+    paned = tk.PanedWindow(result_window, orient=tk.VERTICAL)
+    paned.pack(fill=tk.BOTH, expand=True)
+
+    # Frame dei risultati con notebook
+    bottom_frame = tk.Frame(paned, bg="white")
+    paned.add(bottom_frame, stretch="always")
+
+    notebook = ttk.Notebook(bottom_frame)
+    notebook.pack(fill=tk.BOTH, expand=True)
+
+    left_win = int(entry_left.get()) if entry_left.get().isdigit() else 1
+    right_win = int(entry_right.get()) if entry_right.get().isdigit() else 1
+    exclude_pos = ["PUNCT"] if var_excl_punct.get() else []
+    upos_coll = [u.strip() for u in entry_coll_upos.get().strip().split("|")] if entry_coll_upos.get().strip() else None
+
+    # Aggiungi tabs per ogni corpus
+    for corpus_name, sentences in results.items():
+        frame = tk.Frame(notebook, bg="#c5e8eb")
+        notebook.add(frame, text=corpus_name)
+        txt = scrolledtext.ScrolledText(frame, bg="white", fg="black", font=("Times",14))
+        txt.pack(padx=5, pady=5, fill="both", expand=True)
+        txt.tag_config("kwic", foreground="red", font=("Times",14,"bold"))
+
+# 🔹 Riepilogo generale
+        summary = summarize_token_stats(sentences, filters, field=var_kw_field.get(), exclude_pos=exclude_pos)
+        txt.insert(tk.END, "--- Summary ---\n")
+        txt.insert(tk.END, f"Number of sentences containing token(s): {summary['num_sentences']}\n")
+        txt.insert(tk.END, f"Total occurrences of token(s): {summary['total_occurrences']}\n")
+        txt.insert(tk.END, f"Frequency per million tokens (excluding PUNCT if checked): {summary['freq_per_million']:.2f}\n")
+        txt.insert(tk.END, f"Total tokens counted: {summary['total_tokens']}\n\n")
+
+# 🔹 Frasi filtrate
+        txt.insert(tk.END, "Filtered sentences:\n")
+        for s in sentences[:50]:
+            txt.insert(tk.END, f"{s['sent_id']}: {s['text']}\n")
+
+
+        # Keywords
+        if var_show_kw.get():
+            ka = keyword_analysis(sentences, field=var_kw_field.get(), exclude_pos=exclude_pos)
+            txt.insert(tk.END, "\n--- Keyword Analysis ---\n")
+            for val, freq, rel in ka:
+                txt.insert(tk.END, f"{val}: {freq} (Absolute), {rel:.2%} (Relative)\n")
+            tk.Button(frame, text="Export Keywords CSV",
+                      command=partial(export_csv, ka, f"{corpus_name}_keywords.csv", ["Token","AbsFreq","RelFreq"])).pack()
+
+        # KWIC
+        if var_show_kwic.get():
+            concord = kwic(sentences, filters, window=left_win, field=var_kw_field.get())
+            txt.insert(tk.END, "\n--- KWIC ---\n")
+            for c in concord[:50]:
+                txt.insert(tk.END, c['left'])
+                txt.insert(tk.END, f" {c['center']} ", "kwic")
+                txt.insert(tk.END, c['right'] + f"   [{c['sent_id']}]\n")
+
+        # Collocations
+        if var_show_coll.get():
+            coll = collocations(sentences, filters, left=left_win, right=right_win,
+                                field=var_kw_field.get(), upos_include=upos_coll)
+            txt.insert(tk.END, "\n--- Collocations ---\n")
+            for w, freq, rel in coll:
+                txt.insert(tk.END, f"{w}: {freq} (Absolute), {rel:.2%} (Relative)\n")
+            tk.Button(frame, text="Export Collocations CSV",
+                      command=partial(export_csv, coll, f"{corpus_name}_collocations.csv", ["Token","AbsFreq","RelFreq"])).pack()
+
+        # Dependencies
+        if var_show_deps.get():
+            deps = frequent_deps(sentences, filters)
+            txt.insert(tk.END, "\n--- Frequent Dependencies ---\n")
+            for d, freq, rel in deps:
+                txt.insert(tk.END, f"{d}: {freq} (Absolute), {rel:.2%} (Relative)\n")
+            tk.Button(frame, text="Export Dependencies CSV",
+                      command=partial(export_csv, deps, f"{corpus_name}_dependencies.csv", ["Dep","AbsFreq","RelFreq"])).pack()
+
+        # FEATS
+        if var_show_feats.get():
+            feats = frequent_feats(sentences, filters)
+            txt.insert(tk.END, "\n--- Frequent FEATS ---\n")
+            for fval, freq, rel in feats:
+                txt.insert(tk.END, f"{fval}: {freq} (Absolute), {rel:.2%} (Relative)\n")
+            tk.Button(frame, text="Export FEATS CSV",
+                      command=partial(export_csv, feats, f"{corpus_name}_feats.csv", ["Feat","AbsFreq","RelFreq"])).pack()
+
+    # Aggiorna la finestra pop-up
+    result_window.update_idletasks()
+
+
+
+# ---------------- Main ----------------
+BASE_CORPORA="conllu_files"
+all_corpora=read_all_corpora(BASE_CORPORA)
+corpora_list=list(all_corpora.keys())
+
+root = tk.Tk()
+root.title("Python CONLL-U Searcher")
+root.configure(bg="#c5e8eb")
+root.geometry("1400x900")
+root.minsize(1200,800)
+
+root.resizable(True, True)
+
+
+# --- Header ---
+header_frame=tk.Frame(root, bg="#c5e8eb")
+header_frame.pack(pady=5)
+header = tk.Label(header_frame, text="Python CONLL-U Searcher", font=("Times",25,"bold"),
+                  fg="#DD6C97", bg="white", bd=4, relief="solid")
+header.pack(padx=10, pady=5)
+
+# --- Top frame ---
+top_frame = tk.Frame(root, bg="#c5e8eb")
+top_frame.pack(fill="x", padx=10, pady=5)
+
+tk.Label(top_frame,text="Select corpus (Ctrl+click for multi):",bg="#c5e8eb",fg="#049bbc",font=("Times",18)).pack()
+listbox_corpora=tk.Listbox(top_frame,selectmode=tk.MULTIPLE,width=50,height=6,bg="white",fg="#049bbc",font=("Times",18))
+for c in corpora_list: listbox_corpora.insert(tk.END,c)
+listbox_corpora.pack(pady=5)
+
+# Filters
+frame_filt=tk.LabelFrame(top_frame,text="Search Filters",padx=5,pady=5,bg="#c5e8eb",fg="#049bbc",font=("Times",18))
+frame_filt.pack(padx=10,pady=5,fill="x")
+tk.Label(frame_filt,text="Lemma:",bg="#c5e8eb",fg="#049bbc",font=("Times",18)).grid(row=0,column=0)
+entry_lemma=tk.Entry(frame_filt,width=12); entry_lemma.grid(row=0,column=1)
+tk.Label(frame_filt,text="Word:",bg="#c5e8eb",fg="#049bbc",font=("Times",18)).grid(row=1,column=0)
+entry_form=tk.Entry(frame_filt,width=12); entry_form.grid(row=1,column=1)
+tk.Label(frame_filt,text="UPOS (|=OR):",bg="#c5e8eb",fg="#049bbc",font=("Times",18)).grid(row=2,column=0)
+entry_upos=tk.Entry(frame_filt,width=12); entry_upos.grid(row=2,column=1)
+tk.Label(frame_filt,text="FEATS (k=v|...):",bg="#c5e8eb",fg="#049bbc",font=("Times",18)).grid(row=3,column=0)
+entry_feats=tk.Entry(frame_filt,width=40); entry_feats.grid(row=3,column=1,columnspan=2)
+tk.Label(frame_filt,text="MISC (k=v|...):",bg="#c5e8eb",fg="#049bbc",font=("Times",18)).grid(row=4,column=0)
+entry_misc=tk.Entry(frame_filt,width=40); entry_misc.grid(row=4,column=1,columnspan=2)
+tk.Label(frame_filt,text="Sent_id (optional):",bg="#c5e8eb",fg="#049bbc",font=("Times",18)).grid(row=5,column=0)
+entry_sentid=tk.Entry(frame_filt,width=20); entry_sentid.grid(row=5,column=1,columnspan=2)
+tk.Label(frame_filt,text="DEPREL:",bg="#c5e8eb",fg="#049bbc",font=("Times",18)).grid(row=6,column=0)
+entry_deprel=tk.Entry(frame_filt,width=20); entry_deprel.grid(row=6,column=1,columnspan=2)
+
+
+# Options
+frame_opt=tk.LabelFrame(top_frame,text="Options",padx=5,pady=5,bg="#c5e8eb",fg="#049bbc",font=("Times",18))
+frame_opt.pack(padx=10,pady=5,fill="x")
+tk.Label(frame_opt,text="KA/KWIC Field:",bg="#c5e8eb",fg="#049bbc",font=("Times",18)).grid(row=0,column=0)
+var_kw_field=tk.StringVar(value="lemma")
+tk.OptionMenu(frame_opt,var_kw_field,"lemma","form","upos","deprel").grid(row=0,column=1)
+
+var_show_kw=tk.IntVar()
+tk.Checkbutton(frame_opt,text="Show Keyword Analysis",variable=var_show_kw,bg="#c5e8eb",fg="#049bbc",font=("Times",18)).grid(row=0,column=2)
+var_show_kwic=tk.IntVar()
+tk.Checkbutton(frame_opt,text="Show KWIC",variable=var_show_kwic,bg="#c5e8eb",fg="#049bbc",font=("Times",18)).grid(row=1,column=0)
+var_show_coll=tk.IntVar()
+tk.Checkbutton(frame_opt,text="Show Collocations",variable=var_show_coll,bg="#c5e8eb",fg="#049bbc",font=("Times",18)).grid(row=1,column=1)
+tk.Label(frame_opt,text="Left window:",bg="#c5e8eb",fg="#049bbc",font=("Times",18)).grid(row=1,column=2)
+entry_left=tk.Entry(frame_opt,width=5); entry_left.insert(0,"1"); entry_left.grid(row=1,column=3)
+tk.Label(frame_opt,text="Right window:",bg="#c5e8eb",fg="#049bbc",font=("Times",18)).grid(row=1,column=4)
+entry_right=tk.Entry(frame_opt,width=5); entry_right.insert(0,"1"); entry_right.grid(row=1,column=5)
+tk.Label(frame_opt,text="Collocation POS filter (|=OR):",bg="#c5e8eb",fg="#049bbc",font=("Times",18)).grid(row=2,column=0)
+entry_coll_upos=tk.Entry(frame_opt,width=20); entry_coll_upos.grid(row=2,column=1)
+var_show_deps=tk.IntVar()
+tk.Checkbutton(frame_opt,text="Show frequent dependencies",variable=var_show_deps,bg="#c5e8eb",fg="#049bbc",font=("Times",18)).grid(row=2,column=2)
+var_show_feats=tk.IntVar()
+tk.Checkbutton(frame_opt,text="Show frequent feats",variable=var_show_feats,bg="#c5e8eb",fg="#049bbc",font=("Times",18)).grid(row=2,column=3)
+var_excl_punct=tk.IntVar()
+tk.Checkbutton(frame_opt,text="Exclude PUNCT from frequencies",variable=var_excl_punct,bg="#c5e8eb",fg="#049bbc",font=("Times",18)).grid(row=3,column=0)
+
+tk.Button(top_frame,text="Search",command=search_gui,bg="#049bbc",fg="black",font=("Times",20,"bold")).pack(pady=5)
+
+
+
+btn_export_kwic = tk.Button(
+    top_frame,
+    text="Export KWIC Tokens (CSV)",
+    bg="#049bbc",
+    fg="white",
+    font=("Times",16,"bold"),
+    state="disabled"
+)
+btn_export_kwic.pack(pady=5)
+
+
+
+
+root = tk.Tk()
+root.title("Python CONLL-U Searcher")
+root.geometry("1400x900")
+root.minsize(1200,800)
+root.resizable(True, True)
+
+# PanedWindow verticale
+paned = tk.PanedWindow(root, orient=tk.VERTICAL)
+paned.pack(fill=tk.BOTH, expand=True)
+
+# Top frame (ricerche e filtri)
+top_frame = tk.Frame(paned, bg="#c5e8eb", height=250)
+paned.add(top_frame)
+
+tk.Label(top_frame,text="Select corpus (Ctrl+click for multi):",bg="#c5e8eb",fg="#049bbc",font=("Times",18)).pack()
+# ... qui metti tutti i tuoi widget di filtri, bottoni, etc.
+
+# Bottom frame (notebook)
+bottom_frame = tk.Frame(paned, bg="white")
+paned.add(bottom_frame)
+
+notebook = ttk.Notebook(bottom_frame)
+notebook.pack(fill=tk.BOTH, expand=True)
+
+
+root.mainloop()
