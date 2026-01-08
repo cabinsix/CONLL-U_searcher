@@ -113,3 +113,6 @@ Filters are case-insensitive and ignore extra spaces
 KWIC and collocations can be POS-filtered
 Token frequencies can optionally exclude punctuation (PUNCT)
 
+
+
+CONLL-U searcher. 2026. https://github.com/cabinsix/CONLL-U_searcher. 
